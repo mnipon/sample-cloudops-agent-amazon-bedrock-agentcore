@@ -1,0 +1,95 @@
+@import './theme.css';
+@import './reset.css';
+
+/* Base styles */
+body {
+  font-family: var(--font-family);
+  font-size: var(--font-size-body);
+  color: var(--color-text);
+  background-color: var(--color-chat-bg);
+  line-height: 1.5;
+}
+
+#root {
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* Focus indicator styles for keyboard accessibility */
+:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+/* Remove default focus for mouse users */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* Screen-reader-only utility */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
+/*
+ * Responsive breakpoints (reference)
+ * --breakpoint-mobile: 375px
+ * --breakpoint-tablet: 768px
+ * --breakpoint-desktop: 1024px
+ *
+ * Sidebar visible:    >= 1024px
+ * Sidebar collapsed:  < 1024px (hamburger menu)
+ */
+
+/* Custom Amplify Authenticator styling */
+.auth-wrapper {
+  width: 100%;
+  height: 100vh;
+}
+
+.auth-wrapper [data-amplify-authenticator][data-state="signIn"],
+.auth-wrapper [data-amplify-authenticator][data-state="signUp"],
+.auth-wrapper [data-amplify-authenticator][data-state="resetPassword"],
+.auth-wrapper [data-amplify-authenticator][data-state="confirmSignIn"],
+.auth-wrapper [data-amplify-authenticator][data-state="confirmResetPassword"] {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  background: linear-gradient(135deg, #f8fafc 0%, #e0e7ff 50%, #f3e8ff 100%);
+}
+
+.auth-wrapper [data-amplify-authenticator] {
+  --amplify-components-authenticator-router-border-width: 0;
+  --amplify-components-authenticator-router-box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
+  --amplify-components-authenticator-router-border-color: transparent;
+  --amplify-components-authenticator-form-padding: 24px;
+  --amplify-colors-background-primary: #ffffff;
+  --amplify-colors-brand-primary-10: #eef2ff;
+  --amplify-colors-brand-primary-20: #e0e7ff;
+  --amplify-colors-brand-primary-40: #a5b4fc;
+  --amplify-colors-brand-primary-60: #818cf8;
+  --amplify-colors-brand-primary-80: #6366f1;
+  --amplify-colors-brand-primary-90: #4f46e5;
+  --amplify-colors-brand-primary-100: #4338ca;
+  --amplify-components-button-primary-background-color: #6366f1;
+  --amplify-components-button-primary-hover-background-color: #4f46e5;
+  --amplify-components-tabs-item-active-border-color: #6366f1;
+  --amplify-components-tabs-item-active-color: #6366f1;
+  --amplify-radii-small: 8px;
+  --amplify-radii-medium: 12px;
+  --amplify-radii-large: 16px;
+}
+
+.auth-wrapper [data-amplify-router] {
+  border-radius: 16px;
+  overflow: hidden;
+}

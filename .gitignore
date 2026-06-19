@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+frontend/dist/
+cdk/cdk.out/
+*.zip
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Backup files
+*.backup
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# CDK
+cdk.context.json

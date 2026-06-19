@@ -1,0 +1,20 @@
+.layout {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  height: 100vh;
+}
+
+/* Mobile: main takes full width */
+@media (max-width: 1023px) {
+  .main {
+    width: 100%;
+  }
+}
