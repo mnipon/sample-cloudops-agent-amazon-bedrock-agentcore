@@ -550,13 +550,22 @@ export class MCPRuntimeStack extends cdk.Stack {
           image: lambda.Runtime.PYTHON_3_12.bundlingImage,
           command: [
             'bash', '-c',
-            'pip install -r requirements.txt -t /asset-output && cp -au . /asset-output',
+            // --no-warn-conflicts: the scraper's deps (boto3/requests/bs4) are
+            // pure-Python and install cleanly into the asset dir; the flag just
+            // suppresses pip's noisy notice about UNRELATED packages that happen
+            // to be present in the surrounding environment.
+            'pip install -r requirements.txt -t /asset-output --no-warn-conflicts && cp -au . /asset-output',
           ],
           local: {
             tryBundle(outputDir: string) {
               const { execSync } = require('child_process');
               try {
-                execSync(`pip install -r ${eolScraperPath}/requirements.txt -t ${outputDir} --quiet`);
+                // --no-warn-conflicts silences pip's "dependency resolver does
+                // not currently take into account..." notice, which is triggered
+                // by pre-existing packages in the host Python env (strands-agents,
+                // awscli, etc.) — NOT by the scraper's own requirements. The
+                // install into outputDir is isolated and unaffected.
+                execSync(`pip install -r ${eolScraperPath}/requirements.txt -t ${outputDir} --quiet --no-warn-conflicts`);
                 execSync(`cp -r ${eolScraperPath}/eol_scraper ${outputDir}/`);
                 return true;
               } catch {
