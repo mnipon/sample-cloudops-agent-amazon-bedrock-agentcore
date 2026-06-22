@@ -27,8 +27,9 @@ flowchart TB
         ConvService["Conversation Service"]
     end
 
-    subgraph Auth["Authentication"]
+    subgraph Auth["Authentication & Role Mapping"]
         Cognito["Amazon Cognito<br/>User Pool + Identity Pool"]
+        AdminGroup["Administrators Group<br/>+ Pre-Token-Generation Lambda<br/>(injects scalar role claim)"]
     end
 
     subgraph ConvAPI["Conversation History"]
@@ -40,7 +41,7 @@ flowchart TB
     subgraph AgentCore["Amazon Bedrock AgentCore"]
         Runtime["Agent Runtime<br/>(Strands Agent + Claude Sonnet)"]
         Memory["AgentCore Memory<br/>(Session Context)"]
-        Gateway["AgentCore Gateway<br/>(Tool Discovery + Routing)"]
+        Gateway["AgentCore Gateway<br/>(CUSTOM_JWT + Cedar Policy<br/>+ Deny-Audit Interceptor)"]
     end
 
     subgraph MCPServers["MCP Server Runtimes"]
@@ -65,15 +66,16 @@ flowchart TB
 
     Browser --> AuthUI
     AuthUI --> Cognito
+    Cognito --> AdminGroup
     Cognito --> ChatUI
-    ChatUI -->|"SigV4 signed POST"| Runtime
+    ChatUI -->|"SigV4 POST + user access token (role claim)"| Runtime
     ChatUI --> ConvService
     ConvService -->|"JWT Token"| APIGW
     APIGW --> ConvLambda
     ConvLambda --> DDB
 
     Runtime --> Memory
-    Runtime -->|"Tool calls"| Gateway
+    Runtime -->|"Tool calls (user JWT Bearer)"| Gateway
     Gateway -->|"OAuth + JWT"| Billing
     Gateway -->|"OAuth + JWT"| Pricing
     Gateway -->|"OAuth + JWT"| CloudWatch
@@ -98,22 +100,34 @@ sequenceDiagram
     participant U as User (Browser)
     participant F as Frontend (React)
     participant C as Cognito
+    participant P as Pre-Token-Gen Lambda
     participant R as AgentCore Runtime
     participant G as Gateway
     participant M as MCP Server
     participant D as DynamoDB (Conversations)
 
+    Note over U,P: Sign-in / token issuance (once per login or refresh)
+    U->>C: Sign in (Amplify Authenticator)
+    C->>P: Pre-Token-Generation trigger (cognito:groups)
+    P-->>C: Inject scalar role claim (admin / nonadmin)
+    C-->>F: ID + access JWTs (role claim baked in)
+
+    Note over U,D: Per chat message
     U->>F: Enter query
     F->>D: Save user message (POST /conversations/{id})
-    F->>R: POST /runtimes/{arn}/invocations (SigV4)
+    F->>R: POST /runtimes/{arn}/invocations (SigV4) + user access token
     Note over F: Shows "Working..." indicator
 
-    R->>G: Discover tools (x_amz_bedrock_agentcore_search)
-    G-->>R: Available tool names
-    R->>G: Call tool (e.g., billingMcp___get_costs)
-    G->>M: Forward to MCP server (OAuth)
-    M-->>G: Tool result
-    G-->>R: Response
+    R->>G: Discover/call tools — forwards user JWT as Bearer
+    Note over G: Validates JWT (CUSTOM_JWT) and evaluates<br/>AgentCore Policy (Cedar) against the role claim
+    alt tool category permitted for the user's role
+        G->>M: Forward to MCP server (OAuth)
+        M-->>G: Tool result
+        G-->>R: Response
+    else category denied (non-admin → cloudwatch/cloudtrail/inventory)
+        G-->>R: AuthorizeActionException (no tool data)
+        Note over R: Returns "not available for your role"
+    end
 
     R-->>F: Streaming response (JSON with result)
     F->>D: Save agent message (PUT /conversations/{id})
@@ -122,10 +136,11 @@ sequenceDiagram
 
 #### Step-by-Step Walkthrough
 
+0. **Sign-in & token issuance (happens once per login/refresh, before any query)** — When the user signs in through the Amplify Authenticator, Cognito authenticates them and then synchronously invokes the **Pre-Token-Generation Lambda** trigger. That Lambda reads the user's `cognito:groups` and injects a scalar `role` claim (`"admin"` if in the `Administrators` group, otherwise `"nonadmin"`) into both the ID and access tokens before Cognito signs them. The role is therefore baked into the JWT at issuance — it is **not** computed on the request path below, and it is not a stored user attribute (decode a token to see it). Changing a user's group membership takes effect the next time their tokens are issued or refreshed.
 1. **User submits a query** — The user types a question (e.g. "Which RDS instances are approaching end of support?") into the React chat interface and presses send.
 2. **Persist the user message** — The frontend immediately saves the user's message to DynamoDB via `POST /conversations/{id}`, so the conversation survives reloads even before the agent responds.
-3. **Invoke the agent** — The frontend sends the query to the AgentCore Runtime with a SigV4-signed `POST /runtimes/{arn}/invocations` request. The user's Cognito credentials authorize the call. A "Working..." indicator is shown while the request is in flight.
-4. **Tool discovery** — The Strands agent in the Runtime asks the AgentCore Gateway which tools are available (`x_amz_bedrock_agentcore_search`). The Gateway returns the set of MCP tool names across all registered servers (Billing, Pricing, CloudWatch, CloudTrail, Inventory).
+3. **Invoke the agent** — The frontend sends the query to the AgentCore Runtime with a SigV4-signed `POST /runtimes/{arn}/invocations` request, and includes the user's Cognito **access token** (carrying the `role` claim) in the payload. A "Working..." indicator is shown while the request is in flight.
+4. **Tool discovery** — The Strands agent in the Runtime discovers tools through the AgentCore Gateway, forwarding the user's token as a Bearer credential. It lists tools via standard MCP `tools/list`, and because the Gateway is configured for **semantic search**, the agent also calls the Gateway's built-in `x_amz_bedrock_agentcore_search` tool to surface tools that aren't immediately visible (CloudWatch, CloudTrail, Inventory, Pricing). Discovery is **not** role-filtered — the full tool catalog across all registered servers (Billing, Pricing, CloudWatch, CloudTrail, Inventory) is visible to every authenticated user. Authorization is enforced at tool **invocation**, not discovery: AgentCore Policy (Cedar) makes the per-user allow/deny decision when a tool is actually called (see [Role-Based Tool Access Control](#role-based-tool-access-control)).
 5. **Reasoning and tool selection** — Claude Sonnet reasons over the query and the available tools, then decides which tool(s) to call and with what arguments (e.g. `inventoryMcp___list_rds_instances`).
 6. **Tool invocation** — The Runtime calls the chosen tool through the Gateway. The Gateway forwards the request to the appropriate MCP server runtime over an OAuth-authenticated connection.
 7. **MCP server queries AWS** — The MCP server calls the relevant AWS APIs (and, for Inventory, enriches results with end-of-support dates read from the `aws-eol-schedules` DynamoDB table) and returns a structured result to the Gateway, which relays it back to the Runtime.
@@ -137,28 +152,49 @@ sequenceDiagram
 
 The request path crosses three trust boundaries, each using a different mechanism. No long-lived AWS keys are used anywhere in the flow — every hop relies on short-lived tokens or temporary credentials.
 
-| Hop                           | Mechanism                       | Credential / token                                                                                                                                             |
-| ----------------------------- | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| User → Frontend               | Cognito User Pool sign-in       | User signs in via the Amplify Authenticator and receives Cognito **ID + access JWTs** (`openid`, `email`, `profile`)                                           |
-| Frontend → Conversation API   | Cognito JWT (API Gateway)       | The Cognito **ID token** is sent as the `Authorization` header; an API Gateway **Cognito User Pools Authorizer** validates it                                  |
-| Frontend → AgentCore Runtime  | IAM / SigV4                     | The Identity Pool exchanges the authenticated identity for **temporary STS credentials** (the `AuthenticatedRole`), used to SigV4-sign `InvokeAgentRuntime`    |
-| Runtime → Gateway             | IAM / SigV4                     | The Runtime's **execution role** (`InvokeGateway` permission) signs the call; the Gateway's authorizer type is `AWS_IAM`                                       |
-| Gateway → MCP Server Runtimes | OAuth 2.0 bearer (client creds) | The Gateway exchanges the **M2M client ID + secret** for a Cognito **OAuth access token** (scope `mcp-runtime-server/invoke`) and sends it as a `Bearer` token |
-| MCP Server → AWS service APIs | IAM / SigV4                     | Each MCP Runtime's **own execution role** (read-only scoped) signs the AWS API calls and DynamoDB reads                                                        |
+| Hop                           | Mechanism                       | Credential / token                                                                                                                                                                                                                                                      |
+| ----------------------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| User → Frontend               | Cognito User Pool sign-in       | User signs in via the Amplify Authenticator and receives Cognito **ID + access JWTs**. A **Pre-Token-Generation Lambda** injects a scalar `role` claim (`admin`/`nonadmin`) based on `Administrators` group membership                                                  |
+| Frontend → Conversation API   | Cognito JWT (API Gateway)       | The Cognito **ID token** is sent as the `Authorization` header; an API Gateway **Cognito User Pools Authorizer** validates it                                                                                                                                           |
+| Frontend → AgentCore Runtime  | IAM / SigV4 + forwarded JWT     | The Identity Pool exchanges the authenticated identity for **temporary STS credentials** (the `AuthenticatedRole`) to SigV4-sign `InvokeAgentRuntime`; the user's Cognito **access token** is also conveyed in the payload so the role can reach the Gateway            |
+| Runtime → Gateway             | OAuth 2.0 bearer (user JWT)     | The Runtime forwards the user's Cognito access token as a `Bearer` token. The Gateway's authorizer type is **`CUSTOM_JWT`** (validates against the Cognito issuer + `AllowedClients`), then **AgentCore Policy** (Cedar) authorizes the tool by the user's `role` claim |
+| Gateway → MCP Server Runtimes | OAuth 2.0 bearer (client creds) | The Gateway exchanges the **M2M client ID + secret** for a Cognito **OAuth access token** (scope `mcp-runtime-server/invoke`) and sends it as a `Bearer` token                                                                                                          |
+| MCP Server → AWS service APIs | IAM / SigV4                     | Each MCP Runtime's **own execution role** (read-only scoped) signs the AWS API calls and DynamoDB reads                                                                                                                                                                 |
 
 **Token exchange details:**
 
 1. **User identity (Cognito).** After sign-in, Cognito issues JWTs. The Cognito **Identity Pool** then federates that identity through STS `AssumeRoleWithWebIdentity` to mint **temporary AWS credentials** bound to the `AuthenticatedRole`. That role allows `bedrock-agentcore:InvokeAgentRuntime` (plus `GetRuntime`/`ListRuntimes`) scoped to the `cloudops_*` runtimes — unauthenticated identities are explicitly denied everything.
 
-2. **Two parallel paths from the frontend.** Conversation history calls go to **API Gateway**, which validates the raw **Cognito JWT** (no IAM involved). Agent invocations go to the **AgentCore Runtime** using **SigV4** signed with the temporary credentials. These are deliberately separate: data persistence is user-scoped via JWT claims, while agent invocation is gated by IAM.
+2. **Two parallel paths from the frontend.** Conversation history calls go to **API Gateway**, which validates the raw **Cognito JWT** (no IAM involved). Agent invocations go to the **AgentCore Runtime** using **SigV4** signed with the temporary credentials, and additionally carry the user's Cognito **access token** in the payload. These are deliberately separate: data persistence is user-scoped via JWT claims, while agent invocation is gated by IAM.
 
-3. **Runtime to Gateway (IAM).** The main agent Runtime assumes its **execution role** to call the Gateway. The Gateway is configured with `AuthorizerType: AWS_IAM`, so it authorizes the caller by IAM principal — no token is passed here.
+3. **Runtime to Gateway (CUSTOM_JWT + Policy).** The Runtime forwards the user's Cognito access token to the Gateway as a `Bearer` token (it does **not** sign with its own IAM principal for the inbound auth). The Gateway's `CUSTOM_JWT` authorizer validates the token against the Cognito OpenID discovery URL and the `AllowedClients` allowlist (the FrontEnd app client). The verified JWT claims — including the `role` claim — are then evaluated by **AgentCore Policy** (Cedar) to make a per-user allow/deny decision for each tool. If no resolvable user identity reaches the Gateway, the `NonAdmin` role applies by default. See [Role-Based Tool Access Control](#role-based-tool-access-control).
 
 4. **Gateway to MCP servers (OAuth token exchange).** This is the only OAuth hop. Each Gateway target is wired to an **OAuth2 credential provider** backed by a Cognito **machine-to-machine (M2M) app client** using the `client_credentials` grant. The M2M client secret is stored in **Secrets Manager**; AgentCore Identity (`GetResourceOauth2Token` / `GetWorkloadAccessToken`) performs the exchange against the Cognito **token endpoint** and caches the resulting bearer token. The Gateway attaches that token to each MCP request.
 
 5. **MCP server JWT validation.** Every MCP Runtime is deployed with a `CustomJWTAuthorizer` configured with the Cognito **OpenID discovery URL** and an `AllowedClients` allowlist containing the M2M client ID. It validates the incoming bearer token's signature (against Cognito's JWKS), issuer, and client ID before serving any tool call.
 
 6. **MCP server to AWS (least privilege).** Once authorized, the MCP server uses **its own runtime execution role** to call AWS — these roles are read-only and tightly scoped (e.g. the Inventory role grants only `eks:*`/`rds:Describe*`/`es:*`/`elasticache:*`/`kafka:*` describe-style actions plus `dynamodb:GetItem`/`Query`/`Scan` on the EOL table). The EOL scraper Lambda runs under a separate role with write access to the EOL table and the `Describe*Versions` APIs.
+
+## Role-Based Tool Access Control
+
+The Gateway enforces fine-grained, role-based authorization over the MCP tool categories using **Policy in Amazon Bedrock AgentCore** (Cedar policy language). Access is bound to the user's verified identity, not to any client-supplied value.
+
+| Role          | How it's assigned                              | Allowed tool categories                                 |
+| ------------- | ---------------------------------------------- | ------------------------------------------------------- |
+| **Admin**     | Member of the Cognito `Administrators` group   | billing, pricing, **cloudwatch, cloudtrail, inventory** |
+| **Non-Admin** | Any authenticated user not in `Administrators` | billing, pricing only                                   |
+
+How it works end to end:
+
+1. **Role assignment (AuthStack).** A **Pre-Token-Generation Lambda** reads the user's `cognito:groups` and injects a scalar `role` claim (`"admin"` or `"nonadmin"`) into both the ID and access tokens. Membership of the `Administrators` Cognito group is what designates Admin.
+2. **Identity propagation.** The FrontEnd forwards the user's Cognito **access token** to the Agent Runtime, which forwards it unmodified to the Gateway as a `Bearer` token. The role therefore travels inside a Cognito-signed token that the Gateway independently verifies — it cannot be spoofed via the request payload.
+3. **Enforcement (Gateway + Cedar).** The Gateway's `CUSTOM_JWT` authorizer validates the token, then the AgentCore **Policy Engine** evaluates two Cedar policies against the verified `role` claim:
+   - `permit` **billing** + **pricing** for every authenticated user;
+   - `permit` **cloudwatch** + **cloudtrail** + **inventory** only when `role == "admin"`.
+     Cedar is **default-deny**, so a Non-Admin invoking a denied category — or any future tool category added later — is denied unless explicitly permitted. Each tool category maps to a Gateway **target action group** (e.g. `AgentCore::Action::"cloudwatchMcp"`), so policies reference targets without enumerating individual tool names.
+4. **Denial handling & audit.** A denied invocation returns an authorization error identifying the category (no tool data), and the Agent Runtime surfaces a "not available for your role" message. A **deny-audit REQUEST interceptor** emits a single structured CloudWatch record per deny (`identityRef` = JWT `sub`, category, `deny`, timestamp) — never the token or tool arguments.
+
+> **Note:** because the role is carried in the user's token, the **FrontEnd must be deployed** and configured against this stack's Cognito User Pool / app client for Admin users to be recognized. If the token is not forwarded, the Gateway applies the `NonAdmin` role by default (billing/pricing only).
 
 ## Features
 
@@ -168,6 +204,7 @@ The request path crosses three trust boundaries, each using a different mechanis
 - **CloudWatch Monitoring** — Metrics, alarms, log groups, and Logs Insights queries
 - **CloudTrail Auditing** — API activity lookups, trail status, IAM change tracking
 - **Cluster Inventory** — EKS, RDS/Aurora, OpenSearch, ElastiCache, MSK with version lifecycle tracking
+- **Role-Based Tool Access Control** — Admin users access all tool categories; non-admin users are limited to billing/pricing, enforced at the Gateway by AgentCore Policy (Cedar). See [Role-Based Tool Access Control](#role-based-tool-access-control)
 
 ### MCP Servers
 
@@ -207,6 +244,7 @@ Five Model Context Protocol servers provide 30+ specialized tools:
 - Amazon Cognito User Pool + Identity Pool
 - Custom branded Amplify Authenticator login page
 - Multi-user isolation for all data
+- Role-based authorization via a `role` claim injected at token generation (Admin vs Non-Admin), enforced at the Gateway — see [Role-Based Tool Access Control](#role-based-tool-access-control)
 
 ## Tech Stack
 
@@ -228,9 +266,9 @@ Five Model Context Protocol servers provide 30+ specialized tools:
 Deploy via `npx cdk deploy --all` from the `cdk/` directory. Six stacks are provisioned:
 
 1. **ImageStack** — ECR repositories + CodeBuild projects for container images
-2. **AuthStack** — Cognito User Pool, Identity Pool, M2M client, IAM roles
+2. **AuthStack** — Cognito User Pool (Essentials feature plan), Identity Pool, M2M client, IAM roles, the `Administrators` group, and the Pre-Token-Generation Lambda that injects the `role` claim
 3. **MCPRuntimeStack** — AgentCore Runtimes for Billing, Pricing, CloudWatch, CloudTrail, Inventory MCP servers
-4. **AgentCoreGatewayStack** — Unified tool discovery/invocation endpoint with OAuth
+4. **AgentCoreGatewayStack** — Unified tool discovery/invocation endpoint with `CUSTOM_JWT` inbound auth, an AgentCore **Policy Engine** (Cedar role→category rules), a deny-audit interceptor, and OAuth credential provider for the MCP targets
 5. **AgentRuntimeStack** — Main Strands agent with Gateway integration and AgentCore Memory
 6. **ConversationHistoryStack** — DynamoDB table + API Gateway + Lambda for conversation persistence
 
@@ -299,6 +337,16 @@ cd ../frontend && npm install && npm run build && npm run zip
 # Sign in with admin + temporary password from email
 # Configure settings with stack outputs
 ```
+
+The bootstrap `admin` user is automatically added to the `Administrators` group, so it resolves to the **Admin** role (all tool categories). To test the **Non-Admin** experience, create a user that is not in `Administrators`:
+
+```bash
+# Replace <UserPoolId> with the AuthStack output
+aws cognito-idp admin-create-user --user-pool-id <UserPoolId> --username analyst --message-action SUPPRESS
+aws cognito-idp admin-set-user-password --user-pool-id <UserPoolId> --username analyst --password '<StrongPassword>' --permanent
+```
+
+That user will be limited to the billing and pricing tools; cloudwatch/cloudtrail/inventory requests return a "not available for your role" response.
 
 ## Sample Queries
 

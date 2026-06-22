@@ -23,12 +23,18 @@ export class AgentCoreError extends Error {
  *
  * Key insight: The `payload` is sent as the RAW HTTP body (not wrapped in another JSON).
  * The `runtimeSessionId` is sent as a header, not in the body.
+ *
+ * Identity propagation: the caller passes the authenticated user's Cognito token
+ * (carrying the `role` claim injected by the Pre Token Generation Lambda). It is
+ * conveyed to the Agent Runtime in a dedicated `accessToken` body field, which the
+ * runtime forwards to the Gateway so Policy can authorize tools against the user's role.
  */
 export async function invokeAgent(
   prompt: string,
   sessionId: string,
   config: AppConfig,
   credentials: AgentCredentials,
+  accessToken?: string | null,
   signal?: AbortSignal
 ): Promise<string> {
   if (!config.agentcore?.enabled) {
@@ -60,8 +66,15 @@ export async function invokeAgent(
     const url = `https://${hostname}${path}`;
 
     // The payload IS the raw HTTP body — contains the data the @app.entrypoint receives
-    // The backend's invoke(payload) gets this after JSON.parse
-    const body = JSON.stringify({ prompt, sessionId, userId: 'amplify_user' });
+    // The backend's invoke(payload) gets this after JSON.parse.
+    // When present, the user's Cognito token is conveyed under `accessToken` so the
+    // Agent Runtime can forward it to the Gateway for role-based authorization.
+    const body = JSON.stringify({
+      prompt,
+      sessionId,
+      userId: 'amplify_user',
+      ...(accessToken ? { accessToken } : {}),
+    });
 
     // Sign the request with SigV4
     const signer = new SignatureV4({

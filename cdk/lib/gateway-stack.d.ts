@@ -14,6 +14,7 @@ export interface AgentCoreGatewayStackProps extends cdk.StackProps {
     authUserPoolId: string;
     authUserPoolArn: string;
     authM2mClientId: string;
+    authUserPoolClientId: string;
 }
 export declare class AgentCoreGatewayStack extends cdk.Stack {
     readonly gatewayArn: string;

@@ -3,6 +3,7 @@ Amazon Bedrock Agent Core Runtime - CloudOps Agent
 Uses BedrockAgentCoreApp for proper authentication and Gateway integration
 """
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from bedrock_agentcore.runtime import BedrockAgentCoreContext
 from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig
 from bedrock_agentcore.memory.integrations.strands.session_manager import AgentCoreMemorySessionManager
 from strands import Agent
@@ -10,10 +11,13 @@ from strands.models import BedrockModel
 from strands.tools.mcp import MCPClient
 from botocore.credentials import Credentials
 from streamable_http_sigv4 import streamablehttp_client_with_sigv4
+from streamable_http_bearer import streamablehttp_client_with_bearer
+from authorization_model import is_authorization_denial, build_denial_response
 import os
 import boto3
 import logging
 from datetime import datetime, timezone
+from typing import Optional
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -75,17 +79,136 @@ def get_current_date_utc() -> str:
         return "2026-01-24 (Friday) 12:00 UTC"
 
 
-# Global MCP client to keep connection alive
-mcp_client = None
-agent = None
-mcp_tools = []  # Store tools globally
-system_prompt_template = ""  # Store system prompt template
+# Dedicated payload field carrying the user's Cognito token. The role is NEVER
+# read from the payload — only the verified JWT claims at the Gateway determine
+# the role. We forward the token unmodified and let the Gateway derive the role.
+USER_TOKEN_PAYLOAD_FIELD = "accessToken"
+
+
+def resolve_user_token(payload: dict, context=None) -> Optional[str]:
+    """Resolve the user's Cognito JWT from the inbound request.
+
+    The token is read ONLY from the authenticated inbound request — never any
+    role value from the payload. Resolution order:
+
+    1. A dedicated payload field (``accessToken``) carrying the user's Cognito
+       token forwarded by the FrontEnd.
+    2. The runtime's own inbound JWT context (the ``WorkloadAccessToken`` the
+       Gateway/runtime extracts from the inbound request headers), exposed via
+       ``BedrockAgentCoreContext.get_workload_access_token()``.
+
+    Returns the token string if one resolves, otherwise ``None``. When ``None``
+    is returned the caller still invokes the Gateway; the Gateway applies the
+    NonAdmin role by default (Req 7.4).
+
+    NOTE: This function deliberately does not read any ``role``/``Role`` field
+    from the payload. Role must come only from the verified token claims at the
+    Gateway (Req 1.5).
+    """
+    # 1. Dedicated payload field forwarded by the FrontEnd.
+    token = payload.get(USER_TOKEN_PAYLOAD_FIELD) if isinstance(payload, dict) else None
+    if token:
+        logger.info("🔐 Resolved user token from inbound payload field")
+        return token
+
+    # 2. Runtime's inbound JWT context (best effort).
+    try:
+        token = BedrockAgentCoreContext.get_workload_access_token()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(f"Failed to read inbound JWT context: {e}")
+        token = None
+
+    if token:
+        logger.info("🔐 Resolved user token from runtime inbound JWT context")
+        return token
+
+    logger.info("ℹ️ No user token resolved — Gateway will apply NonAdmin by default")
+    return None
+
+
+def build_mcp_client_for_token(token: Optional[str]) -> MCPClient:
+    """Create a per-request MCP client for the resolved user identity.
+
+    When a user token is present, the client uses the Bearer transport that
+    forwards the user's Cognito JWT unmodified to the Gateway, so the Gateway
+    can derive the user's role from verified JWT claims (Req 7.2, 7.3).
+
+    When no token resolves, the client falls back to the SigV4 transport (the
+    runtime's own IAM principal) so the Gateway is still called rather than the
+    request being blocked; the Gateway applies the NonAdmin role by default
+    (Req 7.4). The SigV4 path is retained only as an incremental-migration
+    fallback — the primary path for user requests forwards the user JWT.
+
+    The returned client is NOT yet connected; the caller manages its lifecycle
+    (per-request tool discovery and invocation are wired in later tasks).
+    """
+    if token:
+        logger.info("🔧 Building per-request MCP client with Bearer (user JWT) transport")
+        return MCPClient(lambda: streamablehttp_client_with_bearer(
+            url=gateway_endpoint,
+            token=token,
+        ))
+
+    logger.info("🔧 Building MCP client with SigV4 fallback transport (no user token)")
+    return MCPClient(lambda: streamablehttp_client_with_sigv4(
+        url=gateway_endpoint,
+        credentials=frozen_credentials,
+        service="bedrock-agentcore",
+        region=AWS_REGION
+    ))
+
+
+# The user-facing tool set is discovered PER REQUEST keyed on the user's token
+# (see invoke). We deliberately do NOT keep a shared global MCP client or a
+# global tool list: a global list would ignore the requesting user's identity
+# and could hand the agent tools the user is not allowed to discover.
+agent = None  # Fallback agent (no tools), used only when per-request setup can't run
+system_prompt_template = ""  # Static system prompt text, safe to build once
+
+
+def list_tools_with_pagination(client: MCPClient) -> list:
+    """List every tool from the Gateway through the given CONNECTED MCP client,
+    following pagination.
+
+    The client MUST already be connected (inside its context manager).
+
+    NOTE (corrected during deployment): discovery is NOT Policy-governed, so the
+    Gateway returns the full tool catalog regardless of the user's role. The
+    forwarded user JWT determines authorization only at tool INVOCATION, where
+    AgentCore Policy (Cedar) denies categories the role may not use (Req 4.3).
+    A non-admin may therefore see a denied tool in this list but will be denied
+    when calling it. Filtering the catalog by role at discovery (Req 2.2, 3.2,
+    4.2) would require a future RESPONSE interceptor.
+    """
+    all_tools = []
+    pagination_token = None
+    while True:
+        tools_page = client.list_tools_sync(pagination_token=pagination_token)
+        all_tools.extend(tools_page)
+        logger.info(f"  Retrieved {len(tools_page)} tools (total so far: {len(all_tools)})")
+        # Check if there are more pages
+        if hasattr(tools_page, 'pagination_token') and tools_page.pagination_token:
+            pagination_token = tools_page.pagination_token
+            logger.info("  More tools available, fetching next page...")
+        else:
+            break
+    return all_tools
 
 
 def initialize_agent_with_gateway():
-    """Initialize agent with Gateway tools using MCP Client with SigV4 auth"""
-    global mcp_client, agent, mcp_tools, system_prompt_template
-    
+    """Set up the static system prompt template and a fallback (no-tools) agent.
+
+    Tool discovery now runs PER REQUEST keyed on the user's token (see
+    ``invoke``), so this module-load setup deliberately does NOT connect to the
+    Gateway or list tools globally — doing so would build a shared global tool
+    list that ignores the requesting user. This function only:
+
+    - builds the static, role-independent system prompt template, and
+    - creates a fallback agent (without tools) used when the Gateway endpoint is
+      not configured or per-request setup cannot run.
+    """
+    global agent, system_prompt_template
+
     try:
         if not gateway_endpoint:
             logger.error("Cannot initialize: Gateway endpoint not configured")
@@ -94,36 +217,6 @@ def initialize_agent_with_gateway():
                 system_prompt="I'm sorry, but I'm not properly configured. Please contact support."
             )
             return
-        
-        logger.info("🔧 Initializing MCP Client with SigV4 authentication...")
-        
-        # Create MCP client with SigV4 authentication
-        mcp_client = MCPClient(lambda: streamablehttp_client_with_sigv4(
-            url=gateway_endpoint,
-            credentials=frozen_credentials,
-            service="bedrock-agentcore",
-            region=AWS_REGION
-        ))
-        
-        # Start the MCP client connection
-        mcp_client.__enter__()
-        
-        # Get tools from Gateway (handle pagination)
-        logger.info("📋 Listing tools from Gateway...")
-        all_tools = []
-        pagination_token = None
-        while True:
-            tools_page = mcp_client.list_tools_sync(pagination_token=pagination_token)
-            all_tools.extend(tools_page)
-            logger.info(f"  Retrieved {len(tools_page)} tools (total so far: {len(all_tools)})")
-            # Check if there are more pages
-            if hasattr(tools_page, 'pagination_token') and tools_page.pagination_token:
-                pagination_token = tools_page.pagination_token
-                logger.info(f"  More tools available, fetching next page...")
-            else:
-                break
-        mcp_tools = all_tools
-        logger.info(f"✅ Retrieved {len(mcp_tools)} tools from Gateway (all pages)")
         
         # Get current date for system prompt
         current_date = get_current_date_utc()
@@ -196,18 +289,19 @@ When using Inventory tools:
 
 Be concise, accurate, and actionable in your responses."""
         
-        # Create agent with Gateway tools (memory will be added per-request)
-        # Note: We don't add session_manager here because it's request-specific
+        # Fallback agent WITHOUT Gateway tools. The real, user-facing agent is
+        # built PER REQUEST in invoke() with exactly the tools the user's
+        # identity is permitted to discover. This base agent is only used when
+        # per-request setup cannot run.
         agent = Agent(
             model=model,
-            tools=mcp_tools,
             system_prompt=system_prompt_template
         )
         
-        logger.info("✅ Agent created successfully with Gateway tools - connection kept alive")
+        logger.info("✅ Base agent initialized — per-request tool discovery enabled")
             
     except Exception as e:
-        logger.error(f"❌ Error initializing agent with Gateway: {e}", exc_info=True)
+        logger.error(f"❌ Error initializing base agent: {e}", exc_info=True)
         # Create a fallback agent without tools
         agent = Agent(
             model=model,
@@ -221,12 +315,16 @@ initialize_agent_with_gateway()
 
 
 @app.entrypoint
-def invoke(payload):
+def invoke(payload, context=None):
     """
     Process user input and return CloudOps analysis
-    """
-    global agent
 
+    The optional ``context`` parameter is the runtime-provided RequestContext.
+    When the handler declares it, the AgentCore runtime injects per-request
+    metadata. The user's Cognito token is resolved from the inbound request
+    (a dedicated ``accessToken`` payload field or the runtime's inbound JWT
+    context) and forwarded to the Gateway via a per-request Bearer MCP client.
+    """
     user_message = payload.get("prompt", "")
     session_id = payload.get("sessionId", "default_session")
     user_id = payload.get("userId", "default_user")
@@ -240,76 +338,128 @@ def invoke(payload):
 
     logger.info(f"📨 Processing request - Session: {session_id}")
 
-    # Create agent with memory session manager if memory is configured
-    agent_with_memory = agent  # Default to base agent
+    # Resolve the user's Cognito token from the inbound request (never a role
+    # field from the payload) and build a per-request MCP client that forwards
+    # the token unmodified to the Gateway. If no token resolves, the helper
+    # falls back to the SigV4 transport so the Gateway is still called and
+    # applies the NonAdmin role by default (Req 7.2, 7.3, 7.4).
+    user_token = resolve_user_token(payload, context)
+    request_mcp_client = build_mcp_client_for_token(user_token)
 
-    if MEMORY_ID and mcp_tools:  # Only configure memory if we have tools
-        try:
-            logger.info(f"💾 Configuring memory - Memory ID: {MEMORY_ID}, Session: {session_id}")
-
-            memory_config = AgentCoreMemoryConfig(
-                memory_id=MEMORY_ID,
-                session_id=session_id,
-                actor_id=user_id
-            )
-
-            session_manager = AgentCoreMemorySessionManager(
-                agentcore_memory_config=memory_config,
-                region_name=AWS_REGION
-            )
-
-            # Create agent with session manager (memory handled automatically)
-            agent_with_memory = Agent(
-                model=model,
-                tools=mcp_tools,  # Use globally stored tools
-                system_prompt=system_prompt_template,  # Use stored system prompt
-                session_manager=session_manager  # This handles memory automatically!
-            )
-
-            logger.info("✅ Agent configured with memory session manager")
-
-        except Exception as e:
-            logger.warning(f"⚠️ Could not configure memory, using agent without memory: {e}")
-            agent_with_memory = agent
-    else:
-        if not MEMORY_ID:
-            logger.info("ℹ️ Memory not configured, using agent without memory")
-        else:
-            logger.warning("⚠️ Tools not available, using agent without memory")
-
-    # Invoke agent - memory is handled automatically by session_manager
+    # Per-request path: open the user's MCP client connection, discover tools
+    # through that connection (so the Gateway returns only the tools the user's
+    # role may discover), build a per-request agent with exactly those tools,
+    # and invoke it. The connection stays open for the full duration of tool
+    # discovery AND the agent run, and is closed when the `with` block exits.
+    #
+    # When the Gateway's Cedar Policy denies a tool invocation it returns an
+    # AuthorizeActionException. By the time it surfaces here it may arrive as an
+    # mcp McpError, a strands tool/agent error wrapping it, or a plain
+    # Exception, so we classify it by content (is_authorization_denial) rather
+    # than by a single brittle exception type, and map it to a role-appropriate,
+    # data-free response (build_denial_response) ahead of the generic handler
+    # (Req 8.5).
+    #
+    # LIMITATION: the strands Agent loop orchestrates tool calls internally. If a
+    # denial is swallowed mid-loop and never re-raised out of request_agent(...),
+    # it cannot be caught here; this handler covers the case where the
+    # authorization error propagates out of the per-request invocation. The
+    # Gateway still denies the invocation and returns no tool data regardless, so
+    # no denied-tool data can leak even in the swallowed case.
     try:
-        logger.info("🤖 Invoking agent...")
-        result = agent_with_memory(user_message)
+        with request_mcp_client:
+            # Per-request tool discovery keyed on the user's token. We never
+            # reuse a shared global tool list that ignores the user
+            # (Req 2.2, 3.2, 4.2).
+            logger.info("📋 Listing tools per request through the user's identity...")
+            request_tools = list_tools_with_pagination(request_mcp_client)
+            logger.info(f"✅ Retrieved {len(request_tools)} tools for this request (all pages)")
 
-        # Extract the final message from the result
-        if hasattr(result, 'message'):
-            final_message = result.message
-        elif hasattr(result, 'content'):
-            final_message = result.content
-        elif isinstance(result, str):
-            final_message = result
-        else:
-            final_message = str(result)
+            # Configure the memory session manager when memory is enabled,
+            # feeding it the per-request tools.
+            session_manager = None
+            if MEMORY_ID:
+                try:
+                    logger.info(f"💾 Configuring memory - Memory ID: {MEMORY_ID}, Session: {session_id}")
 
-        # If final_message is a dict with role/content structure, extract the text
-        if isinstance(final_message, dict):
-            if 'content' in final_message and isinstance(final_message['content'], list):
-                final_message = ''.join([item.get('text', '') for item in final_message['content'] if 'text' in item])
-            elif 'text' in final_message:
-                final_message = final_message['text']
+                    memory_config = AgentCoreMemoryConfig(
+                        memory_id=MEMORY_ID,
+                        session_id=session_id,
+                        actor_id=user_id
+                    )
 
-        logger.info("✅ Request processed successfully")
+                    session_manager = AgentCoreMemorySessionManager(
+                        agentcore_memory_config=memory_config,
+                        region_name=AWS_REGION
+                    )
 
-        response = {
-            "result": final_message,
-            "sessionId": session_id,
-            "userId": user_id
-        }
+                    logger.info("✅ Memory session manager configured")
 
-        return response
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not configure memory, proceeding without memory: {e}")
+                    session_manager = None
+            else:
+                logger.info("ℹ️ Memory not configured, using agent without memory")
+
+            # Build the per-request agent with the per-request tools and the
+            # static system prompt (plus the memory session manager when
+            # configured). Memory, when present, is handled automatically by
+            # the session manager.
+            agent_kwargs = {
+                "model": model,
+                "tools": request_tools,
+                "system_prompt": system_prompt_template,
+            }
+            if session_manager is not None:
+                agent_kwargs["session_manager"] = session_manager
+            request_agent = Agent(**agent_kwargs)
+
+            logger.info("🤖 Invoking agent...")
+            result = request_agent(user_message)
+
+            # Extract the final message from the result
+            if hasattr(result, 'message'):
+                final_message = result.message
+            elif hasattr(result, 'content'):
+                final_message = result.content
+            elif isinstance(result, str):
+                final_message = result
+            else:
+                final_message = str(result)
+
+            # If final_message is a dict with role/content structure, extract the text
+            if isinstance(final_message, dict):
+                if 'content' in final_message and isinstance(final_message['content'], list):
+                    final_message = ''.join([item.get('text', '') for item in final_message['content'] if 'text' in item])
+                elif 'text' in final_message:
+                    final_message = final_message['text']
+
+            logger.info("✅ Request processed successfully")
+
+            return {
+                "result": final_message,
+                "sessionId": session_id,
+                "userId": user_id
+            }
 
     except Exception as e:
+        # Specific authorization-denial handler (Req 8.5): a Policy deny surfaces
+        # as an authorization error. Return a role-appropriate "capability not
+        # available for your role" response that excludes ALL denied-tool data.
+        # The raw exception text is only classified/inspected for the category;
+        # it is never echoed into the user-facing response.
+        if is_authorization_denial(e):
+            logger.warning(
+                "🚫 Tool invocation denied by Gateway authorization policy; "
+                "returning role-appropriate unavailable response"
+            )
+            return build_denial_response(
+                e,
+                session_id=session_id,
+                user_id=user_id,
+            )
+
+        # Generic fallback handler for all other failures.
         logger.error(f"❌ Agent invocation error: {e}", exc_info=True)
         return {
             "error": "Agent processing failed",

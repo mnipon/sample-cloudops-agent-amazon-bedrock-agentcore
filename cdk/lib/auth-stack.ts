@@ -3,7 +3,16 @@ import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import { Construct } from 'constructs';
+import * as path from 'path';
 import { NagSuppressions } from 'cdk-nag';
+
+/**
+ * Name of the Cognito group whose members are designated the Admin role.
+ * The Pre Token Generation Lambda maps membership of this group to the scalar
+ * `role` claim ("admin"); all other users resolve to "nonadmin".
+ * Feature: gateway-tool-access-control (Requirement 1.1).
+ */
+const ADMIN_GROUP_NAME = 'Administrators';
 
 export interface AuthStackProps extends cdk.StackProps {
   adminEmail: string;
@@ -21,6 +30,10 @@ export class AuthStack extends cdk.Stack {
   public readonly oauthIssuer: string;
   public readonly oauthProviderName: string;
   public readonly oauthProviderArn: string;
+  /** Name of the Cognito group whose members resolve to the Admin role. */
+  public readonly adminGroupName: string = ADMIN_GROUP_NAME;
+  /** Name of the scalar role claim injected into the issued tokens. */
+  public readonly roleClaimName: string = 'role';
 
   constructor(scope: Construct, id: string, props: AuthStackProps) {
     super(scope, id, props);
@@ -60,12 +73,54 @@ export class AuthStack extends cdk.Stack {
         requireSymbols: true, // Add symbol requirement for stronger security
       },
       accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+      // The Essentials feature plan is required for the V2_0 Pre Token
+      // Generation trigger, which is what enables access-token (not just
+      // ID-token) claim customization. The `role` claim must reach the
+      // access token because the Agent Runtime forwards it to the Gateway.
+      // Feature: gateway-tool-access-control (Requirement 1.1).
+      featurePlan: cognito.FeaturePlan.ESSENTIALS,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
     this.userPoolId = userPool.userPoolId;
     this.userPoolArn = userPool.userPoolArn;
     this.userPoolProviderName = userPool.userPoolProviderName;
+
+    // ========================================
+    // Pre Token Generation Lambda + role claim
+    // ========================================
+    // Injects a scalar `role` claim ("admin" | "nonadmin") into the user's
+    // tokens based on `Administrators` group membership, so the AgentCore
+    // Gateway's Cedar policy can authorize tool access by role. The role is
+    // derived solely from verified group membership, never a client-supplied
+    // value. Feature: gateway-tool-access-control (Requirement 1.1).
+    const preTokenGenerationFn = new lambda.Function(this, 'PreTokenGenerationFunction', {
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'handler.handler',
+      code: lambda.Code.fromAsset(path.join(__dirname, '../lambda/pre-token-generation')),
+      memorySize: 128,
+      timeout: cdk.Duration.seconds(5),
+      description: 'Cognito Pre Token Generation trigger: maps Administrators group membership to a scalar role claim',
+    });
+
+    // Attach as the Pre Token Generation trigger using the V2_0 event, which is
+    // what enables access-token claim customization (requires the Essentials
+    // feature plan set on the User Pool above). addTrigger also grants Cognito
+    // permission to invoke the function.
+    userPool.addTrigger(
+      cognito.UserPoolOperation.PRE_TOKEN_GENERATION_CONFIG,
+      preTokenGenerationFn,
+      cognito.LambdaVersion.V2_0,
+    );
+
+    // ========================================
+    // Cognito Group — Administrators (Admin role)
+    // ========================================
+    const administratorsGroup = new cognito.CfnUserPoolGroup(this, 'AdministratorsGroup', {
+      userPoolId: userPool.userPoolId,
+      groupName: this.adminGroupName,
+      description: 'Members of this group resolve to the Admin role (full tool access) at the AgentCore Gateway.',
+    });
 
     // Add Cognito Domain for OAuth
     const userPoolDomain = userPool.addDomain('CloudOpsDomain', {
@@ -238,7 +293,7 @@ export class AuthStack extends cdk.Stack {
     // Admin User
     // ========================================
 
-    new cognito.CfnUserPoolUser(this, 'AdminUser', {
+    const adminUser = new cognito.CfnUserPoolUser(this, 'AdminUser', {
       userPoolId: userPool.userPoolId,
       username: 'admin',
       userAttributes: [
@@ -253,6 +308,17 @@ export class AuthStack extends cdk.Stack {
       ],
       desiredDeliveryMediums: ['EMAIL'],
     });
+
+    // Add the bootstrap admin user to the Administrators group so it resolves
+    // to the Admin role. The attachment must be created after both the user and
+    // the group exist. Feature: gateway-tool-access-control (Requirement 1.1).
+    const adminGroupMembership = new cognito.CfnUserPoolUserToGroupAttachment(this, 'AdminUserGroupAttachment', {
+      userPoolId: userPool.userPoolId,
+      groupName: this.adminGroupName,
+      username: adminUser.username as string,
+    });
+    adminGroupMembership.addDependency(adminUser);
+    adminGroupMembership.addDependency(administratorsGroup);
 
     // ========================================
     // Outputs
@@ -327,6 +393,18 @@ export class AuthStack extends cdk.Stack {
       description: 'Admin username',
     });
 
+    new cdk.CfnOutput(this, 'AdminGroupName', {
+      value: this.adminGroupName,
+      description: 'Cognito group whose members resolve to the Admin role',
+      exportName: `${this.stackName}-AdminGroupName`,
+    });
+
+    new cdk.CfnOutput(this, 'RoleClaimName', {
+      value: this.roleClaimName,
+      description: 'Scalar role claim injected into issued tokens by the Pre Token Generation Lambda',
+      exportName: `${this.stackName}-RoleClaimName`,
+    });
+
     // ========================================
     // OAuth Provider - Created by external Python script after stack deploy
     // ========================================
@@ -352,6 +430,19 @@ export class AuthStack extends cdk.Stack {
       {
         id: 'AwsSolutions-COG3',
         reason: 'Advanced security features (compromised credentials check) not required for demo/development environment. Production deployments should enable AdvancedSecurityMode.',
+      },
+    ], true);
+
+    // Pre Token Generation Lambda suppressions
+    NagSuppressions.addResourceSuppressions(preTokenGenerationFn, [
+      {
+        id: 'AwsSolutions-IAM4',
+        reason: 'AWSLambdaBasicExecutionRole managed policy is AWS best practice for the Pre Token Generation Lambda execution role (CloudWatch Logs access only)',
+        appliesTo: ['Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'],
+      },
+      {
+        id: 'AwsSolutions-L1',
+        reason: 'Pre Token Generation Lambda pinned to Python 3.12, consistent with the other Python Lambdas in this project',
       },
     ], true);
 

@@ -15,5 +15,9 @@ export declare class AuthStack extends cdk.Stack {
     readonly oauthIssuer: string;
     readonly oauthProviderName: string;
     readonly oauthProviderArn: string;
+    /** Name of the Cognito group whose members resolve to the Admin role. */
+    readonly adminGroupName: string;
+    /** Name of the scalar role claim injected into the issued tokens. */
+    readonly roleClaimName: string;
     constructor(scope: Construct, id: string, props: AuthStackProps);
 }

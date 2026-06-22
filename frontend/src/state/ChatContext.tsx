@@ -35,6 +35,25 @@ async function getAuthToken(): Promise<string | null> {
   }
 }
 
+/**
+ * Resolves the Cognito token forwarded to the Agent Runtime for role-based
+ * authorization. The `role` claim is injected into both the access and ID
+ * tokens by the Pre Token Generation Lambda; the access token is the one the
+ * Gateway's CUSTOM_JWT authorizer validates, with the ID token as a fallback.
+ */
+async function getRuntimeToken(): Promise<string | null> {
+  try {
+    const session = await fetchAuthSession();
+    return (
+      session.tokens?.accessToken?.toString() ||
+      session.tokens?.idToken?.toString() ||
+      null
+    );
+  } catch {
+    return null;
+  }
+}
+
 export function ChatProvider({ children }: { children: React.ReactNode }) {
   const [state, dispatch] = useReducer(chatReducer, initialChatState);
   // Map of conversationId → AbortController for in-flight requests
@@ -56,6 +75,23 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     async (content: string, credentials: AgentCredentials) => {
       // Capture the conversation this request belongs to AT SEND TIME
       const targetConversationId = sessionIdRef.current;
+
+      // Req 7.5: If there is no authenticated identity, the SPA must NOT invoke
+      // the Agent Runtime. Resolve the user's Cognito token up front; when none
+      // can be resolved (no Cognito session/token), surface an auth-required
+      // error and bail out before mutating chat state or calling the runtime.
+      // The originalPrompt is preserved so the user can retry after signing in.
+      const runtimeToken = await getRuntimeToken();
+      if (!runtimeToken) {
+        dispatch({
+          type: 'SET_ERROR',
+          payload: {
+            message: 'You must be signed in to send a message. Please sign in and try again.',
+            originalPrompt: content,
+          },
+        });
+        return;
+      }
 
       // Only abort if there's already a request for THIS conversation
       const existingController = activeRequestsRef.current.get(targetConversationId);
@@ -94,6 +130,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           targetConversationId,
           config,
           credentials,
+          runtimeToken,
           controller.signal
         );
 

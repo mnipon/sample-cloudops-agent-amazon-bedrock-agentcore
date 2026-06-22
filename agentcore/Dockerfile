@@ -32,6 +32,10 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 # Copy application code
 COPY agent_runtime.py .
 COPY streamable_http_sigv4.py .
+# Bearer transport (per-user JWT forwarding) and the pure authorization model
+# (role derivation + denial-response helpers) are imported by agent_runtime.py.
+COPY streamable_http_bearer.py .
+COPY authorization_model.py .
 
 # Set ownership to non-root user
 RUN chown -R appuser:appuser /app

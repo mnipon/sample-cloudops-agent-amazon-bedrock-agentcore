@@ -10,6 +10,12 @@ import { NagSuppressions } from 'cdk-nag';
 export interface ConversationHistoryStackProps extends cdk.StackProps {
   userPoolArn: string;
   userPoolId: string;
+  // The remaining values the FrontEnd `appConfig` needs, passed in so this
+  // (last-deployed) stack can emit a single consolidated FrontEnd config output
+  // alongside the Conversation API URL it owns.
+  userPoolClientId: string;
+  identityPoolId: string;
+  agentRuntimeArn: string;
 }
 
 export class ConversationHistoryStack extends cdk.Stack {
@@ -115,6 +121,53 @@ export class ConversationHistoryStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'ConversationApiUrl', {
       value: this.api.url,
       description: 'Conversation API endpoint URL',
+      exportName: `${this.stackName}-ConversationApiUrl`,
+    });
+
+    // Echo the other FrontEnd-relevant values here too, so an admin can read
+    // EVERYTHING the FrontEnd needs from this one (last-deployed) stack's
+    // outputs instead of hunting across AuthStack + AgentRuntimeStack.
+    new cdk.CfnOutput(this, 'UserPoolId', {
+      value: props.userPoolId,
+      description: 'Cognito User Pool ID (FrontEnd appConfig: cognito.userPoolId)',
+    });
+    new cdk.CfnOutput(this, 'UserPoolClientId', {
+      value: props.userPoolClientId,
+      description: 'Cognito User Pool Client ID (FrontEnd appConfig: cognito.userPoolClientId)',
+    });
+    new cdk.CfnOutput(this, 'IdentityPoolId', {
+      value: props.identityPoolId,
+      description: 'Cognito Identity Pool ID (FrontEnd appConfig: cognito.identityPoolId)',
+    });
+    new cdk.CfnOutput(this, 'AgentCoreArn', {
+      value: props.agentRuntimeArn,
+      description: 'AgentCore Runtime ARN (FrontEnd appConfig: agentcore.agentArn)',
+    });
+
+    // Single copy-paste-ready FrontEnd configuration. This is the exact JSON
+    // shape the SPA reads from localStorage("appConfig"), assembled from every
+    // stack so the admin can configure the FrontEnd in one step. Tokens
+    // (User Pool ID, client ID, identity pool, agent ARN, API URL) are resolved
+    // by CloudFormation at deploy time.
+    const frontEndConfig = {
+      cognito: {
+        userPoolId: props.userPoolId,
+        userPoolClientId: props.userPoolClientId,
+        identityPoolId: props.identityPoolId,
+        region: this.region,
+      },
+      agentcore: {
+        enabled: true,
+        region: this.region,
+        agentArn: props.agentRuntimeArn,
+      },
+      conversationApi: {
+        endpoint: this.api.url,
+      },
+    };
+    new cdk.CfnOutput(this, 'FrontEndConfig', {
+      value: JSON.stringify(frontEndConfig),
+      description: 'Copy-paste this JSON into the FrontEnd localStorage key "appConfig"',
     });
 
     // ========================================

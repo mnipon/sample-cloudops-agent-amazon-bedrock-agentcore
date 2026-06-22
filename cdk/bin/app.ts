@@ -85,6 +85,8 @@ const agentCoreGatewayStack = new AgentCoreGatewayStack(app, 'CloudOpsAgentCoreG
   authUserPoolId: authStack.userPoolId,
   authUserPoolArn: authStack.userPoolArn,
   authM2mClientId: authStack.oauthClientId,
+  // FrontEnd User Pool client ID - allowed audience for inbound CUSTOM_JWT auth
+  authUserPoolClientId: authStack.userPoolClientId,
 });
 agentCoreGatewayStack.addDependency(mcpRuntimeStack);
 agentCoreGatewayStack.addDependency(authStack);
@@ -110,8 +112,16 @@ const conversationHistoryStack = new ConversationHistoryStack(app, 'CloudOpsConv
   description: 'CloudOps Agent - Conversation History (DynamoDB + API Gateway)',
   userPoolArn: authStack.userPoolArn,
   userPoolId: authStack.userPoolId,
+  // Passed through so this last-deployed stack can emit a single consolidated
+  // FrontEnd config output (cognito + agentcore + conversationApi).
+  userPoolClientId: authStack.userPoolClientId,
+  identityPoolId: authStack.identityPoolId,
+  agentRuntimeArn: agentRuntimeStack.mainRuntimeArn,
 });
 conversationHistoryStack.addDependency(authStack);
+// Depends on the AgentRuntime stack so the consolidated FrontEnd config output
+// can include the AgentCore Runtime ARN (deploys after it as a result).
+conversationHistoryStack.addDependency(agentRuntimeStack);
 
 // Add tags to all stacks
 cdk.Tags.of(app).add('Project', 'CloudOpsAgent');
