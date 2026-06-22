@@ -423,7 +423,7 @@ export class MCPRuntimeStack extends cdk.Stack {
         sortKey: { name: 'version', type: dynamodb.AttributeType.STRING },
         billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
         removalPolicy: cdk.RemovalPolicy.DESTROY,
-        pointInTimeRecovery: true,
+        pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
       });
       eolTableName = eolTable.tableName;
     }
