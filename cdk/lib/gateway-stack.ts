@@ -924,9 +924,9 @@ def handler(event, context):
     // these statements to `action in [AgentCore::Action::"billingMcp___...", …]`
     // (enumerated) or the schema's documented category attribute. The
     // role->category SEMANTICS above are the invariant; only the action-match
-    // expression is provisional. ValidationMode is IGNORE_ALL_FINDINGS so the
-    // engine accepts the policies during this provisional phase; tighten to
-    // FAIL_ON_ANY_FINDINGS once the action model is confirmed.
+    // expression is provisional. Validation runs in FAIL_ON_ANY_FINDINGS so a
+    // malformed policy fails the deployment loudly instead of being silently
+    // accepted.
     // ========================================
 
     const gatewayArnRef = this.gatewayArn;
