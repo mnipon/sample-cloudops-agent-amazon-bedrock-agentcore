@@ -85,23 +85,6 @@ def get_current_date_utc() -> str:
 # the role. We forward the token unmodified and let the Gateway derive the role.
 USER_TOKEN_PAYLOAD_FIELD = "accessToken"  # nosec B105 - JSON field name, not a credential
 
-# Sentinel that replaces any token-bearing value when a payload/body/header
-# collection is routed through redaction. The Raw_Token must never reach any log
-# output, in whole or in any substring (Req 7.1), so we substitute this marker
-# rather than truncating (a prefix/suffix would still leak a substring).
-REDACTED_PLACEHOLDER = "***REDACTED***"  # nosec B105 - mask marker, not a credential
-
-# Names whose VALUES carry the Raw_Token and must be masked before any
-# payload/body/header collection is logged (Req 7.6, 8.4):
-#   - ``accessToken``  : the request-body field carrying the user's Cognito token
-#                        on the FrontEnd -> Agent_Runtime hop (Req 8.1).
-#   - ``Authorization``: the Bearer header carrying the token on the
-#                        Agent_Runtime -> Gateway hop (Req 8.2). Matched
-#                        case-insensitively because HTTP header casing is not
-#                        stable across layers.
-_SENSITIVE_EXACT_KEYS = frozenset({USER_TOKEN_PAYLOAD_FIELD})
-_SENSITIVE_LOWER_KEYS = frozenset({"authorization"})
-
 # Fail-closed AgentCore Memory actor used when NO verified Cognito ``sub`` can be
 # resolved for a request (BUG 1 fix, Req 2.1, 3.2). When memory is enabled we
 # still build an AgentCoreMemoryConfig for shape parity, but a token-less request
@@ -111,57 +94,6 @@ _SENSITIVE_LOWER_KEYS = frozenset({"authorization"})
 # runtime's fail-closed NonAdmin posture: an anonymous request is the least-
 # privileged identity, never a per-user one derived from client-supplied data.
 TOKENLESS_MEMORY_ACTOR_ID = "unauthenticated"
-
-
-def redact_sensitive(obj):
-    """Return a copy of ``obj`` with token-bearing values masked (safe-log path).
-
-    PRIMARY POSTURE: the runtime does not currently log raw payloads, request
-    bodies, or headers at all — nothing token-bearing is written to a log on any
-    hop (Req 7.1). Because there is no live log path that emits such data, this
-    helper is NOT an active masking control routed on a real logging code path;
-    no call site currently sends payloads/bodies/headers through it.
-
-    This helper exists as the one correct, token-safe path to route through
-    SHOULD any FUTURE diagnostic ever need to log such a collection. If that
-    happens, its argument must be passed through ``redact_sensitive`` first
-    rather than logged raw. When used, it masks:
-
-      - the ``accessToken`` field value (the user's Cognito token forwarded in
-        the request body on the FrontEnd -> Agent_Runtime hop, Req 8.1/8.4), and
-      - the ``Authorization`` header value (the Bearer credential on the
-        Agent_Runtime -> Gateway hop, Req 8.2),
-
-    replacing each with ``REDACTED_PLACEHOLDER`` while leaving every
-    non-sensitive field intact (Req 7.6). Nested dicts and lists/tuples are
-    walked recursively so a token nested anywhere in the structure is still
-    masked.
-
-    The helper is defensive by contract and NEVER raises on unexpected shapes:
-    any value that is not a dict/list/tuple is returned unchanged, a key whose
-    name matches a sensitive field has its value masked regardless of the
-    value's type, and any unexpected error during the walk collapses to the
-    redaction marker.
-    """
-    try:
-        if isinstance(obj, dict):
-            redacted = {}
-            for key, value in obj.items():
-                is_sensitive = (
-                    key in _SENSITIVE_EXACT_KEYS
-                    or (isinstance(key, str) and key.lower() in _SENSITIVE_LOWER_KEYS)
-                )
-                redacted[key] = (
-                    REDACTED_PLACEHOLDER if is_sensitive else redact_sensitive(value)
-                )
-            return redacted
-        if isinstance(obj, list):
-            return [redact_sensitive(item) for item in obj]
-        if isinstance(obj, tuple):
-            return tuple(redact_sensitive(item) for item in obj)
-    except Exception:  # pragma: no cover - defensive: redaction must never raise
-        return REDACTED_PLACEHOLDER
-    return obj
 
 
 def resolve_user_token(payload: dict, context=None) -> Optional[str]:
@@ -282,8 +214,7 @@ def build_mcp_client_for_token(token: Optional[str]) -> MCPClient:
       unmodified as an ``Authorization: Bearer <token>`` header, so the Gateway
       derives the user's role from verified JWT claims (Req 8.2). The token is
       conveyed in the ``Authorization`` header on this hop — never in a log
-      (Req 7.1); any header collection that must be logged is routed through
-      ``redact_sensitive`` first (Req 7.6).
+      (Req 7.1, 7.6). The runtime does not log raw payloads/bodies/headers.
 
     - When NO token resolves, the client falls back to the SigV4 transport
       (``streamable_http_sigv4.py``) signed with the runtime's own IAM
@@ -510,9 +441,8 @@ def invoke(payload, context=None):
     # but reaches it with no Verified_JWT, so it applies the NonAdmin role by
     # default. The runtime never escalates a token-less request to Admin based
     # on payload content — this is the explicit fail-closed posture
-    # (Req 5.1, 5.2, 5.3, 5.5). The Raw_Token is never logged; any payload/body/
-    # header collection that must be logged is routed through redact_sensitive
-    # first (Req 7.1, 7.6).
+    # (Req 5.1, 5.2, 5.3, 5.5). The Raw_Token is never logged; the runtime does
+    # not log raw payloads/bodies/headers at all (Req 7.1, 7.6).
     user_token = resolve_user_token(payload, context)
     request_mcp_client = build_mcp_client_for_token(user_token)
 
