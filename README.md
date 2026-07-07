@@ -64,6 +64,14 @@ flowchart TB
         EOLTable["DynamoDB<br/>(EOL Schedules)"]
     end
 
+    subgraph Scheduled["Scheduled Data Refresh"]
+        EolScraper["EOL Scraper Lambda<br/>(daily EventBridge, no VPC)"]
+    end
+
+    subgraph ExternalNet["External Internet (public egress)"]
+        Docs["docs.aws.amazon.com<br/>(public docs — untrusted HTML)"]
+    end
+
     Browser --> AuthUI
     AuthUI --> Cognito
     Cognito --> AdminGroup
@@ -91,7 +99,17 @@ flowchart TB
     Inventory --> EC
     Inventory --> MSK
     Inventory --> EOLTable
+
+    EolScraper -->|"scrape EOL dates (HTTPS, unrestricted public egress)"| Docs
+    EolScraper -->|"write EOL schedules (date-only verify, fails open)"| EOLTable
 ```
+
+> **Note on the EOL data path:** the EOL Scraper Lambda runs on a daily schedule with no VPC and
+> unrestricted outbound egress, fetching untrusted HTML from `docs.aws.amazon.com` and writing the
+> parsed end-of-support dates into the table the Inventory tools serve to users. This external-data
+> path is modeled in `THREAT_MODEL.md` as threat **T13** (data integrity) and asset **AS10**; the
+> broader unrestricted-egress posture is **T8 / A7**. Both are knowingly accepted for the
+> educational scope.
 
 ### Request Flow
 
@@ -443,6 +461,29 @@ Then delete the Frontend UI running on Amplify Hosting:
 ## Disclaimer
 
 This repository provides sample code for educational and demonstration purposes only. It is not intended for direct production use without proper review, testing, and validation. Always test generated infrastructure artifacts (Terraform, Helm charts, kubectl commands) in non-production environments first. Use at your own risk — the authors are not responsible for any issues, damages, or losses that may result from using this code in production.
+
+### Network posture (intentional, educational scope)
+
+Private networking is **intentionally not implemented** in this sample. As a deliberate,
+documented trade-off for a learning project:
+
+- **All six runtimes** — the main agent runtime and all five MCP runtimes (billing, pricing,
+  cloudwatch, cloudtrail, inventory) — run in AgentCore **`NetworkMode: PUBLIC`**, and the **EOL
+  scraper Lambda runs with no VPC**. As a result, **every component has unrestricted outbound
+  internet egress.** Inbound is still gated (runtimes are only reachable through the authenticated
+  AgentCore data plane / a verified token), but **outbound/egress is not restricted.**
+- A production deployment should restrict egress with **VPC + PrivateLink** (plus resource
+  policies). Note this is **not a single uniform change**: the CloudWatch/CloudTrail/Inventory
+  runtimes are PrivateLink-viable, but the **Billing/Pricing** runtimes call cost/pricing APIs
+  (Cost Explorer, Budgets, Compute Optimizer, Free Tier, Cost Optimization Hub, Pricing) that
+  generally lack VPC interface endpoints, and the **EOL scraper** needs public egress to
+  `docs.aws.amazon.com` — so those require a NAT + IP-range allow-list or an accepted carve-out.
+- The **EOL scraper** additionally parses untrusted HTML from the public internet into the
+  `aws-eol-schedules` table that the inventory tools serve to users; its verification is date-only
+  and fails open (no source pinning / authenticity check).
+
+These are knowingly accepted risks for the educational scope. See `THREAT_MODEL.md` (assumption
+A7, threats **T8** and **T13**, mitigations **M17/M20/M21**) for the full analysis.
 
 ## License
 
