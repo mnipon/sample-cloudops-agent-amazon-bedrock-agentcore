@@ -192,6 +192,20 @@ export class MCPRuntimeStack extends cdk.Stack {
         },
         EnvironmentVariables: {
           AWS_REGION: this.region,
+          // The Billing MCP server uses the standalone `fastmcp` package (v3+),
+          // which ships a HostOriginGuard middleware that DNS-rebinding-rejects
+          // any Host header outside localhost with HTTP 421 ("Misdirected
+          // Request"). The AgentCore Gateway reaches this runtime through the
+          // authenticated AgentCore ingress (its Host header is the runtime's
+          // public endpoint, not localhost), so the guard rejects tool
+          // discovery with 421 and the Gateway target fails to stabilize.
+          // Disabling host/origin protection is safe here: the runtime is only
+          // reachable via the CustomJWTAuthorizer-protected ingress, so the
+          // browser-focused DNS-rebinding protection is redundant. (The mcp-SDK
+          // FastMCP servers — cloudwatch/cloudtrail/inventory — instead set
+          // `mcp.settings.transport_security = None`, which is the equivalent
+          // for that library.)
+          FASTMCP_HTTP_HOST_ORIGIN_PROTECTION: 'false',
           DEPLOYMENT_TIMESTAMP: new Date().toISOString(),
         },
         ProtocolConfiguration: 'MCP',
@@ -244,6 +258,12 @@ export class MCPRuntimeStack extends cdk.Stack {
         },
         EnvironmentVariables: {
           AWS_REGION: this.region,
+          // The Pricing MCP server also uses the standalone `fastmcp` package.
+          // Its patch currently pins fastmcp<3 (no HostOriginGuard), but set
+          // this defensively so a future pin bump to v3+ does not reintroduce
+          // the 421 Host-header rejection. Harmless on fastmcp v2 (unknown env
+          // vars are ignored). See the Billing runtime above for details.
+          FASTMCP_HTTP_HOST_ORIGIN_PROTECTION: 'false',
           DEPLOYMENT_TIMESTAMP: new Date().toISOString(),
         },
         ProtocolConfiguration: 'MCP',
