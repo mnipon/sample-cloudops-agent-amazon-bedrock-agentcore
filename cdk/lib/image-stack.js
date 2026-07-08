@@ -41,6 +41,7 @@ const iam = __importStar(require("aws-cdk-lib/aws-iam"));
 const s3 = __importStar(require("aws-cdk-lib/aws-s3"));
 const s3deploy = __importStar(require("aws-cdk-lib/aws-s3-deployment"));
 const lambda = __importStar(require("aws-cdk-lib/aws-lambda"));
+const crypto = __importStar(require("crypto"));
 const path = __importStar(require("path"));
 const cdk_nag_1 = require("cdk-nag");
 /**
@@ -633,7 +634,7 @@ class ImageStack extends cdk.Stack {
             serviceToken: triggerFn.functionArn,
             properties: {
                 ProjectName: buildProject.projectName,
-                Timestamp: `${Date.now()}-${Math.random().toString(36).substring(7)}`,
+                Timestamp: `${Date.now()}-${crypto.randomBytes(8).toString('hex')}`,
             },
         });
         cdk_nag_1.NagSuppressions.addResourceSuppressions(buildProject, [

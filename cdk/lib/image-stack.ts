@@ -6,6 +6,7 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import { Construct } from 'constructs';
+import * as crypto from 'crypto';
 import * as path from 'path';
 import { NagSuppressions } from 'cdk-nag';
 
@@ -687,7 +688,7 @@ export class ImageStack extends cdk.Stack {
       serviceToken: triggerFn.functionArn,
       properties: {
         ProjectName: buildProject.projectName,
-        Timestamp: `${Date.now()}-${Math.random().toString(36).substring(7)}`,
+        Timestamp: `${Date.now()}-${crypto.randomBytes(8).toString('hex')}`,
       },
     });
 

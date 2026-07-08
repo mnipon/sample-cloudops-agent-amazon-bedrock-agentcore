@@ -17,7 +17,7 @@ export function resetSession(): string {
 
 function generateSessionId(): string {
   const timestamp = Date.now();
-  const random1 = Math.random().toString(36).substring(2, 15);
-  const random2 = Math.random().toString(36).substring(2, 15);
-  return `agentcore-session-${timestamp}-${random1}-${random2}`;
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+  return `agentcore-session-${timestamp}-${hex}`;
 }
